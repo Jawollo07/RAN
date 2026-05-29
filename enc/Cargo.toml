@@ -6,8 +6,13 @@ repository = "https://github.com/Jawollo07/RAN.git"
 authors = ["Jawollo07"]
 [dependencies]
 aes-256-gcm = "1.1.2"
+anyhow = "1.0.102"
+base64 = "0.22.1"
 chacha20 = "0.10.0"
 hex-literal = "1.1.0"
-rsa = "0.9.10"
+rand = "0.8.5"
+rayon = "1.12.0"
+rsa = { version = "0.9", features = ["sha2"] }
 serde = "1.0.228"
-sha2 = "0.11.0"
+sha2 = "0.10"
+walkdir = "2.5.0"
