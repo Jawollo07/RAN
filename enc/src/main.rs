@@ -98,8 +98,8 @@ fn process_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> 
     // A: INHALT VERSCHLÜSSELN (In-Place)
     encrypt_content(path, &mut cipher)?;
 
-    // B: DATEINAME VERSCHLÜSSELN (Renaming)
-    rename_file(path, &mut cipher)?;
+    // B: DATEINAME VERSCHLÜSSELN (Renaming) — use a separate nonce derived from the original path + "_name"
+    rename_file(path, master_key, meta, &original_path_str)?;
 
     Ok(())
 }
@@ -120,12 +120,25 @@ fn encrypt_content(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rename_file(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<()> {
+fn rename_file(
+    path: &Path,
+    master_key: &[u8; 32],
+    meta: &RecoveryMetadata,
+    original_path_str: &str,
+) -> anyhow::Result<()> {
     let old_name = path.file_name().unwrap().to_string_lossy();
     let mut name_bytes = old_name.as_bytes().to_vec();
 
-    // Wichtig: Cipher zurücksetzen oder neue Nonce für Namen nutzen!
-    cipher.apply_keystream(&mut name_bytes);
+    // Derive a separate nonce for filename encryption so decryption can reproduce it deterministically
+    let parent = Path::new(original_path_str)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name_nonce_input = format!("{}_name", parent);
+    let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
+    let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
+
+    name_cipher.apply_keystream(&mut name_bytes);
 
     let new_name = general_purpose::URL_SAFE_NO_PAD.encode(name_bytes);
     let mut new_path = path.to_path_buf();

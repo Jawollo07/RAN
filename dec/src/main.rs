@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
+use clap::Parser;
 use rayon::prelude::*;
-use rsa::{pkcs8::DecodePrivateKey, PaddingScheme, RsaPrivateKey};
+use rsa::{pkcs8::DecodePrivateKey, Oaep, RsaPrivateKey};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -30,27 +31,57 @@ impl RecoveryMetadata {
     }
 }
 
+#[derive(Parser)]
+#[command(author, version, about = "Recovery tool for RAN encrypted files")]
+struct Args {
+    /// Directory containing encrypted files
+    #[arg(
+        short,
+        long,
+        default_value = "/home/jannik/Cloud/Dev/RAN/enc/test_data"
+    )]
+    target_dir: String,
+
+    /// Path to private PEM key
+    #[arg(
+        short = 'k',
+        long,
+        default_value = "/home/jannik/Cloud/Dev/RAN/keys/private.pem"
+    )]
+    private_key_path: String,
+
+    /// Path to recovery INFO.bin
+    #[arg(
+        short = 'i',
+        long,
+        default_value = "/home/jannik/Cloud/Dev/RAN/enc/INFO.bin"
+    )]
+    recovery_info_path: String,
+
+    /// Dry run (do not modify files)
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
 fn main() -> anyhow::Result<()> {
-    // 1. Parameter laden
-    let target_dir = "/home/jannik/Cloud/Dev/RAN/enc/test_data"; // Beispiel: Zielverzeichnis
-    let private_key_path = "/home/jannik/Cloud/Dev/RAN/keys/private.pem"; // Pfad zum USB-Stick
-    let recovery_info_path = "/home/jannik/Cloud/Dev/RAN/enc/INFO.bin";
+    let args = Args::parse();
+    let target_dir = args.target_dir;
+    let private_key_path = args.private_key_path;
+    let recovery_info_path = args.recovery_info_path;
+    let dry_run = args.dry_run;
 
     println!("--- Recovery Tool ---");
 
     // 2. Private Key & Metadaten laden
     let priv_pem = fs::read_to_string(private_key_path)?;
-    let priv_key = RsaPrivateKey::from_private_key_pem(&priv_pem)?;
+    let priv_key = RsaPrivateKey::from_pkcs8_pem(&priv_pem)?;
 
     let meta_data = fs::read(recovery_info_path)?;
     let meta: RecoveryMetadata = bincode::deserialize(&meta_data)?;
 
     // 3. Master-Key mit RSA entschlüsseln
     let master_key_vec = priv_key
-        .decrypt(
-            PaddingScheme::new_oaep::<sha2::Sha256>(),
-            &meta.encrypted_master_key,
-        )
+        .decrypt(Oaep::new::<Sha256>(), &meta.encrypted_master_key)
         .map_err(|_| anyhow::anyhow!("Falscher Private Key oder beschädigte Metadaten!"))?;
 
     let mut master_key = [0u8; 32];
@@ -64,7 +95,14 @@ fn main() -> anyhow::Result<()> {
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .collect();
-
+    if entries.is_empty() {
+        println!("⚠️  Keine Dateien im Zielverzeichnis gefunden. Überprüfe den Pfad.");
+        return Ok(());
+    }
+    println!(
+        "✅ {} verschlüsselte Dateien gefunden. Starte Wiederherstellung...",
+        entries.len()
+    );
     // 5. Dateien entschlüsseln (In-Place & Rename)
     entries.par_iter().for_each(|path| {
         if let Err(e) = recover_file(path, &master_key, &meta) {
@@ -84,7 +122,11 @@ fn recover_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> 
     let name_bytes = general_purpose::URL_SAFE_NO_PAD.decode(encrypted_name.as_bytes())?;
 
     // Nonce für den Namen berechnen (muss exakt wie beim Encryptor sein!)
-    let name_nonce_input = format!("{}_name", path.to_string_lossy());
+    let parent = path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name_nonce_input = format!("{}_name", parent);
     let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
     let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
 
