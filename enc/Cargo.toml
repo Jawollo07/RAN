@@ -1,0 +1,13 @@
+[package]
+name = "RAN"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/Jawollo07/RAN.git"
+authors = ["Jawollo07"]
+[dependencies]
+aes-256-gcm = "1.1.2"
+chacha20 = "0.10.0"
+hex-literal = "1.1.0"
+rsa = "0.9.10"
+serde = "1.0.228"
+sha2 = "0.11.0"
