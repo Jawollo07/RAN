@@ -9,6 +9,7 @@ dependencies = [
  "aes-256-gcm",
  "anyhow",
  "base64",
+ "bincode",
  "chacha20",
  "hex-literal",
  "rand",
@@ -98,6 +99,12 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
 
 [[package]]
 name = "block-buffer"

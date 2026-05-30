@@ -1,9 +1,8 @@
 use rsa::{
-    pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
     RsaPrivateKey, RsaPublicKey,
+    pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
 };
 use std::fs;
-use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
     let mut rng = rand::thread_rng();

