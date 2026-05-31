@@ -15,7 +15,6 @@ const BUFFER_1MB: usize = 1 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD: u64 = 1 * 1024 * 1024;
 const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024;
 const SPARSE_BLOCKS: usize = 5;
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecoveryMetadata {
     encrypted_master_key: Vec<u8>,
