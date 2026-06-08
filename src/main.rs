@@ -46,6 +46,23 @@ impl RecoveryMetadata {
     }
 }
 
+fn normalized_path_string(root_dir: &Path, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(root_dir) {
+        relative.to_string_lossy().to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    }
+}
+
+fn compute_name_nonce_input(root_dir: &Path, path: &Path) -> String {
+    let parent = if let Ok(relative) = path.strip_prefix(root_dir) {
+        relative.parent().map(|p| p.to_string_lossy().to_string())
+    } else {
+        path.parent().map(|p| p.to_string_lossy().to_string())
+    };
+    format!("{}_name", parent.unwrap_or_default())
+}
+
 // ====================== CHECK / KILL SWITCH ======================
 async fn check() -> bool {
     if DEBUG_MODE {
@@ -74,13 +91,18 @@ async fn check() -> bool {
 }
 
 // ====================== VERSCHLÜSSELUNG ======================
-fn process_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> anyhow::Result<()> {
-    let original_path_str = path.to_string_lossy().to_string();
+fn process_file(
+    path: &Path,
+    root_dir: &Path,
+    master_key: &[u8; 32],
+    meta: &RecoveryMetadata,
+) -> anyhow::Result<()> {
+    let original_path_str = normalized_path_string(root_dir, path);
     let nonce = meta.derive_nonce(master_key, &original_path_str);
     let mut cipher = ChaCha20::new(master_key.into(), &nonce.into());
 
     encrypt_content_tiered(path, &mut cipher)?;
-    rename_file(path, master_key, meta, &original_path_str)?;
+    rename_file(path, root_dir, master_key, meta)?;
 
     Ok(())
 }
@@ -91,7 +113,7 @@ fn encrypt_content_tiered(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<
 
     match size {
         s if s < SMALL_FILE_THRESHOLD => encrypt_full(&mut file, size, cipher)?,
-        s if s < MEDIUM_FILE_THRESHOLD => encrypt_header(&mut file, cipher)?,
+        s if s < MEDIUM_FILE_THRESHOLD => encrypt_header(&mut file, size, cipher)?,
         _ => encrypt_sparse(&mut file, size, cipher)?,
     }
     Ok(())
@@ -106,8 +128,13 @@ fn encrypt_full(file: &mut std::fs::File, size: u64, cipher: &mut ChaCha20) -> a
     Ok(())
 }
 
-fn encrypt_header(file: &mut std::fs::File, cipher: &mut ChaCha20) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; BUFFER_4MB];
+fn encrypt_header(
+    file: &mut std::fs::File,
+    size: u64,
+    cipher: &mut ChaCha20,
+) -> anyhow::Result<()> {
+    let read_len = std::cmp::min(size, BUFFER_4MB as u64) as usize;
+    let mut buffer = vec![0u8; read_len];
     file.read_exact(&mut buffer)?;
     cipher.apply_keystream(&mut buffer);
     file.seek(SeekFrom::Start(0))?;
@@ -120,7 +147,7 @@ fn encrypt_sparse(
     size: u64,
     cipher: &mut ChaCha20,
 ) -> anyhow::Result<()> {
-    encrypt_header(file, cipher)?;
+    encrypt_header(file, size, cipher)?;
 
     let step = size as usize / (SPARSE_BLOCKS + 1);
     for i in 1..=SPARSE_BLOCKS {
@@ -140,19 +167,14 @@ fn encrypt_sparse(
 
 fn rename_file(
     path: &Path,
+    root_dir: &Path,
     master_key: &[u8; 32],
     meta: &RecoveryMetadata,
-    original_path_str: &str,
 ) -> anyhow::Result<()> {
     let old_name = path.file_name().unwrap().to_string_lossy();
     let mut name_bytes = old_name.as_bytes().to_vec();
 
-    let parent = Path::new(original_path_str)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let name_nonce_input = format!("{}_name", parent);
+    let name_nonce_input = compute_name_nonce_input(root_dir, path);
     let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
     let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
 
@@ -310,8 +332,9 @@ impl eframe::App for RANApp {
                                     self.is_valid = true;
                                     self.status_msg =
                                         "✅ Key valid! Decrypting in background...".to_string();
-                                    std::thread::spawn(|| {
-                                        let _ = dec_main();
+                                    let priv_key = self.priv_key.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = dec_main_with_key(&priv_key);
                                     });
                                 } else {
                                     self.status_msg = "❌ Invalid RSA components.".to_string();
@@ -357,29 +380,67 @@ impl eframe::App for RANApp {
 #[derive(Parser)]
 #[command(author, version, about = "Recovery tool for RAN encrypted files")]
 struct Args {
-    #[arg(
-        short,
-        long,
-        default_value = "/home/jannik/Cloud/Dev/RAN/enc/test_data"
-    )]
+    #[arg(short, long, default_value = "/home/jannik/Cloud/Dev/RAN/test_data")]
     target_dir: String,
 
     #[arg(
         short = 'k',
         long,
-        default_value = "/home/jannik/Cloud/Dev/RAN/keys/private.pem"
+        default_value = "/home/jannik/Cloud/Dev/RAN/private.pem"
     )]
     private_key_path: String,
 
     #[arg(
         short = 'i',
         long,
-        default_value = "/home/jannik/Cloud/Dev/RAN/enc/INFO.bin"
+        default_value = "/home/jannik/Cloud/Dev/RAN/INFO.bin"
     )]
     recovery_info_path: String,
 
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+}
+
+fn dec_main_with_key(priv_pem: &str) -> anyhow::Result<()> {
+    println!("--- RAN Recovery Tool (GUI Mode) ---");
+
+    let priv_key = RsaPrivateKey::from_pkcs1_pem(priv_pem)
+        .or_else(|_| RsaPrivateKey::from_pkcs8_pem(priv_pem))?;
+
+    let args = Args::parse();
+    let meta_data = fs::read(&args.recovery_info_path)?;
+    let meta: RecoveryMetadata = bincode::deserialize(&meta_data)?;
+
+    let master_key_vec = priv_key
+        .decrypt(Oaep::new::<Sha256>(), &meta.encrypted_master_key)
+        .map_err(|_| anyhow::anyhow!("Falscher Private Key!"))?
+        .to_vec();
+
+    let mut master_key = [0u8; 32];
+    master_key.copy_from_slice(&master_key_vec);
+
+    let target_dir = PathBuf::from(&args.target_dir);
+    let target_dir = target_dir
+        .canonicalize()
+        .unwrap_or_else(|_| target_dir.clone());
+
+    let entries: Vec<PathBuf> = WalkDir::new(&target_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+
+    println!("{} Dateien gefunden.", entries.len());
+
+    entries.par_iter().for_each(|path| {
+        if let Err(e) = recover_file(path, &target_dir, &master_key, &meta) {
+            eprintln!("Fehler bei {:?}: {}", path, e);
+        }
+    });
+
+    println!("✅ Wiederherstellung abgeschlossen!");
+    Ok(())
 }
 
 fn dec_main() -> anyhow::Result<()> {
@@ -400,7 +461,12 @@ fn dec_main() -> anyhow::Result<()> {
     let mut master_key = [0u8; 32];
     master_key.copy_from_slice(&master_key_vec);
 
-    let entries: Vec<PathBuf> = WalkDir::new(&args.target_dir)
+    let target_dir = PathBuf::from(&args.target_dir);
+    let target_dir = target_dir
+        .canonicalize()
+        .unwrap_or_else(|_| target_dir.clone());
+
+    let entries: Vec<PathBuf> = WalkDir::new(&target_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -410,7 +476,7 @@ fn dec_main() -> anyhow::Result<()> {
     println!("{} Dateien gefunden.", entries.len());
 
     entries.par_iter().for_each(|path| {
-        if let Err(e) = recover_file(path, &master_key, &meta) {
+        if let Err(e) = recover_file(path, &target_dir, &master_key, &meta) {
             eprintln!("Fehler bei {:?}: {}", path, e);
         }
     });
@@ -419,15 +485,16 @@ fn dec_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn recover_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> anyhow::Result<()> {
+fn recover_file(
+    path: &Path,
+    root_dir: &Path,
+    master_key: &[u8; 32],
+    meta: &RecoveryMetadata,
+) -> anyhow::Result<()> {
     let encrypted_name = path.file_name().unwrap().to_string_lossy();
     let name_bytes = general_purpose::URL_SAFE_NO_PAD.decode(encrypted_name.as_bytes())?;
 
-    let parent = path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let name_nonce_input = format!("{}_name", parent);
+    let name_nonce_input = compute_name_nonce_input(root_dir, path);
     let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
     let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
 
@@ -437,7 +504,7 @@ fn recover_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> 
 
     let mut original_path = path.to_path_buf();
     original_path.set_file_name(&original_name);
-    let original_path_str = original_path.to_string_lossy().to_string();
+    let original_path_str = normalized_path_string(root_dir, &original_path);
 
     let content_nonce = meta.derive_nonce(master_key, &original_path_str);
     let mut content_cipher = ChaCha20::new(master_key.into(), &content_nonce.into());
@@ -447,7 +514,7 @@ fn recover_file(path: &Path, master_key: &[u8; 32], meta: &RecoveryMetadata) -> 
 
     match size {
         s if s < SMALL_FILE_THRESHOLD => decrypt_full(&mut file, size, &mut content_cipher)?,
-        s if s < MEDIUM_FILE_THRESHOLD => decrypt_header(&mut file, &mut content_cipher)?,
+        s if s < MEDIUM_FILE_THRESHOLD => decrypt_header(&mut file, size, &mut content_cipher)?,
         _ => decrypt_sparse(&mut file, size, &mut content_cipher)?,
     }
 
@@ -466,8 +533,13 @@ fn decrypt_full(file: &mut std::fs::File, size: u64, cipher: &mut ChaCha20) -> a
     Ok(())
 }
 
-fn decrypt_header(file: &mut std::fs::File, cipher: &mut ChaCha20) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; BUFFER_4MB];
+fn decrypt_header(
+    file: &mut std::fs::File,
+    size: u64,
+    cipher: &mut ChaCha20,
+) -> anyhow::Result<()> {
+    let read_len = std::cmp::min(size, BUFFER_4MB as u64) as usize;
+    let mut buffer = vec![0u8; read_len];
     file.read_exact(&mut buffer)?;
     cipher.apply_keystream(&mut buffer);
     file.seek(SeekFrom::Start(0))?;
@@ -480,7 +552,7 @@ fn decrypt_sparse(
     size: u64,
     cipher: &mut ChaCha20,
 ) -> anyhow::Result<()> {
-    decrypt_header(file, cipher)?;
+    decrypt_header(file, size, cipher)?;
 
     let step = size as usize / (SPARSE_BLOCKS + 1);
     for i in 1..=SPARSE_BLOCKS {
@@ -514,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(0);
     }
 
-    let target_dir = "/home/jannik/Cloud/Dev/RAN/enc/test_data";
+    let target_dir = "/home/jannik/Cloud/Dev/RAN/test_data";
     let dry_run = false;
 
     let pub_key_pem = fs::read_to_string("public.pem")?;
@@ -544,9 +616,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|e| e.into_path())
         .collect();
 
+    let root_dir = PathBuf::from(target_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(target_dir));
+
     entries.par_iter().for_each(|path| {
         if !dry_run {
-            let _ = process_file(path, &master_key, &meta);
+            let _ = process_file(path, &root_dir, &master_key, &meta);
         }
     });
 
