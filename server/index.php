@@ -1,72 +1,46 @@
 <?php
-// Fehler-Reporting (Für Produktion später auf 0 setzen!)
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
 $masterKeyHex = "";
 $error = "";
 $success = "";
-
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token'])) {
-    // Eventuelle Zeilenumbrüche oder Whitespaces aus dem Token entfernen (robuster beim Kopieren)
     $tokenInput = preg_replace('/\s+/', '', $_POST['token']);
-
     try {
-        // OpenSSL Fehlerstack vorsorglich leeren
         while (openssl_error_string());
-
-        // 1. private.pem einlesen
         if (!file_exists('private.pem')) {
-            throw new Exception("Die Datei 'private.pem' wurde nicht im Verzeichnis gefunden!");
+            throw new Exception("The file 'private.pem' was not found in the directory!");
         }
         $privatePemContent = file_get_contents('private.pem');
-
-        // 2. Base64-Token dekodieren
         $tokenBytes = base64_decode($tokenInput, true);
         if ($tokenBytes === false) {
-            throw new Exception("Ungültiges Base64-Format im Token!");
+            throw new Exception("Invalid Base64 format in the token!");
         }
-
-        // Ein ECC-Token muss exakt 92 Bytes lang sein
         $tokenLen = strlen($tokenBytes);
         if ($tokenLen !== 92) {
-            throw new Exception("Ungültige Token-Größe! Erwartet werden exakt 92 Bytes (erhalten: {$tokenLen} Bytes).");
+            throw new Exception("Invalid token size! Exactly 92 bytes expected (received: {$tokenLen} bytes).");
         }
-
-        // 3. Token in seine 3 Bestandteile zerlegen
         $ephemeralPubBytes = substr($tokenBytes, 0, 32);
         $tokenNonce        = substr($tokenBytes, 32, 12);
         $encryptedPayload  = substr($tokenBytes, 44, 48);
-
-        // Für OpenSSL müssen wir den Ciphertext und das 16-Byte Auth-Tag trennen
         $ciphertext        = substr($encryptedPayload, 0, 32);
         $authTag           = substr($encryptedPayload, 32, 16);
-
-        // 4. Temporären Public Key in valides ASN.1 SPKI-PEM verpacken
         $spkiPrefix = hex2bin("302a300506032b656e032100");
         $derBytes = $spkiPrefix . $ephemeralPubBytes;
         $ephemeralPubPem = "-----BEGIN PUBLIC KEY-----\n" . 
                            chunk_split(base64_encode($derBytes), 64, "\n") . 
                            "-----END PUBLIC KEY-----\n";
 
-        // 5. OpenSSL Schlüssel-Ressourcen laden
         $privateKeyRes = openssl_pkey_get_private($privatePemContent);
         if (!$privateKeyRes) {
-            throw new Exception("Konnte die 'private.pem' nicht als gültigen X25519 Private Key laden.");
+            throw new Exception("Could not load 'private.pem' as a valid X25519 private key.");
         }
-
         $ephemeralPubKeyRes = openssl_pkey_get_public($ephemeralPubPem);
         if (!$ephemeralPubKeyRes) {
-            throw new Exception("Konnte den ephemeren Public Key aus dem Token nicht verarbeiten.");
+            throw new Exception("Could not process the ephemeral public key from the token.");
         }
-
-        // 6. Das gemeinsame Geheimnis über Diffie-Hellman (ECDH) berechnen
         $sharedSecret = openssl_pkey_derive($ephemeralPubKeyRes, $privateKeyRes);
         if (!$sharedSecret) {
-            throw new Exception("Konnte das Shared Secret via ECDH nicht berechnen.");
+            throw new Exception("Could not calculate the shared secret via ECDH.");
         }
-
-        // 7. Den Master-Key via ChaCha20-Poly1305 befreien
         $masterKeyRaw = openssl_decrypt(
             $ciphertext,
             'chacha20-poly1305',
@@ -77,19 +51,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token'])) {
         );
 
         if ($masterKeyRaw === false) {
-            throw new Exception("Entschlüsselung fehlgeschlagen! Das Token ist korrupt oder das Schlüsselpaar passt nicht.");
+            throw new Exception("Decryption failed! The token is corrupt or the key pair does not match.");
         }
-
-        // 8. Erfolg: In Hex umwandeln für die Anzeige
         $masterKeyHex = bin2hex($masterKeyRaw);
-        $success = "Token erfolgreich entschlüsselt!";
+        $success = "Token successfully decrypted!";
 
     } catch (Exception $e) {
         $error = $e->getMessage();
     } finally {
-        // Sensible Schlüsseldaten explizit im Speicher überschreiben/löschen
         unset($privatePemContent, $sharedSecret, $masterKeyRaw, $privateKeyRes, $ephemeralPubKeyRes);
-        while (openssl_error_string()); // Verbleibende OpenSSL Fehler verwerfen
+        while (openssl_error_string());
     }
 }
 ?>
@@ -98,7 +69,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RAN - Recovery Admin Panel</title>
+    <title>RAN - Recovery</title>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -207,8 +178,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token'])) {
 <body>
 
 <div class="container">
-    <h1>🔑 RAN - Recovery Token Decrypter</h1>
-    <p style="color: #94a3b8; font-size: 14px;">Füge hier das vom Verschlüsselungs-Tool generierte Base64-Token ein, um den symmetrischen Master-Key zu berechnen.</p>
+    <h1>🔑 RAN - Recovery</h1>
+    <p style="color: #94a3b8; font-size: 14px;">Paste the token generated by RAN here to get the master key.</p>
 
     <?php if ($error): ?>
         <div class="alert alert-error">❌ <?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></div>
@@ -220,19 +191,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token'])) {
 
     <form action="" method="POST">
         <label for="token">Base64 Backup Token:</label>
-        <textarea id="token" name="token" placeholder="🎁 Einfügen..." required autofocus><?php 
-            // Bei Erfolg Textarea leeren, bei Fehler das Input-Token behalten
+        <textarea id="token" name="token" placeholder="🎁 Paste here..." required autofocus><?php 
+            // Clear textarea on success; retain input token on error
             echo !$masterKeyHex && isset($_POST['token']) ? htmlspecialchars($_POST['token'], ENT_QUOTES, 'UTF-8') : ''; 
         ?></textarea>
         
-        <button type="submit">Schlüssel wiederherstellen</button>
+        <button type="submit">Recover Key</button>
     </form>
 
     <?php if ($masterKeyHex): ?>
         <div class="result-box">
-            <label style="color: #4ade80;">🔓 Wiederhergestellter Master-Key (Hex):</label>
+            <label style="color: #4ade80;">🔓 Recovered Master Key (Hex):</label>
             <div class="key-display"><?php echo htmlspecialchars($masterKeyHex, ENT_QUOTES, 'UTF-8'); ?></div>
-            <p style="color: #94a3b8; font-size: 12px; margin-top: 8px; margin-bottom: 0;">Tipp: Ein Klick oder Dreifachklick in die Box markiert den gesamten Schlüssel zum Kopieren.</p>
+            <p style="color: #94a3b8; font-size: 12px; margin-top: 8px; margin-bottom: 0;">Tip: Click or triple-click inside the box to select the entire key for copying.</p>
         </div>
     <?php endif; ?>
 </div>

