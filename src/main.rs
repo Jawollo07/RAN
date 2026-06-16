@@ -52,7 +52,7 @@ pub const RECOVERY_INFO_PATH: &str = if cfg!(target_os = "windows") {
 pub const TARGET_DIR: &str = if cfg!(target_os = "windows") {
     r"C:\"
 } else if cfg!(target_os = "linux") {
-    "/home/jannik/Cloud/Dev/RAN/test_data"
+    "/"
 } else if cfg!(target_os = "macos") {
     "/"
 } else {
@@ -511,7 +511,7 @@ fn run_encryption(
         master_key_hash,
         token,
     };
-    let hex_key = master_key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let _hex_key = master_key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     let current_exe = env::current_exe().ok();
     let absolute_recovery_path = fs::canonicalize(recovery_info_path)
         .unwrap_or_else(|_| recovery_info_path.to_path_buf());
